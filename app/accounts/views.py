@@ -10,7 +10,22 @@ from oauth2_provider.models import Application
 from .forms import RegistrationForm, SetPasswordForm
 from .models import User
 from .utils import make_activation_token, load_activation_token, send_activation_email
+from django.shortcuts import render, redirect
+from django.contrib.auth import authenticate, login
+from django.contrib.auth.forms import AuthenticationForm
+from django.conf import settings
 
+def user_login(request):
+    if request.method == "POST":
+        form = AuthenticationForm(request, data=request.POST)
+        if form.is_valid():
+            user = form.get_user()
+            login(request, user)
+            # Redirect to next URL if present (used by /o/authorize/)
+            return redirect(request.GET.get("next") or settings.LOGIN_REDIRECT_URL)
+    else:
+        form = AuthenticationForm()
+    return render(request, "accounts/login.html", {"form": form})
 
 def register(request):
     """User registration view."""
