@@ -1,125 +1,88 @@
-from urllib.parse import urlencode
-
 from django.conf import settings
-from django.contrib.auth import login
-from django.core.mail import send_mail
-from django.shortcuts import get_object_or_404, redirect, render
-from django.urls import reverse
-from oauth2_provider.models import Application
+from django.contrib.auth import authenticate, login as django_login
+from django.contrib.auth.decorators import login_required
+from django.http import HttpResponseBadRequest, JsonResponse
+from django.shortcuts import redirect, render
+from django.views.decorators.csrf import csrf_exempt
 
-from .forms import RegistrationForm, SetPasswordForm
-from .models import User
-from .utils import make_activation_token, load_activation_token, send_activation_email
-from django.shortcuts import render, redirect
-from django.contrib.auth import authenticate, login
-from django.contrib.auth.forms import AuthenticationForm
-from django.conf import settings
-
-def user_login(request):
-    if request.method == "POST":
-        form = AuthenticationForm(request, data=request.POST)
-        if form.is_valid():
-            user = form.get_user()
-            login(request, user)
-            # Redirect to next URL if present (used by /o/authorize/)
-            return redirect(request.GET.get("next") or settings.LOGIN_REDIRECT_URL)
-    else:
-        form = AuthenticationForm()
-    return render(request, "accounts/login.html", {"form": form})
-
-def register(request):
-    """User registration view."""
-    if request.method == "POST":
-        form = RegistrationForm(request.POST)
-        if form.is_valid():
-            user = form.save()
-            # Send activation email
-            send_activation_email(user)
-            return render(
-                request, "accounts/registration_done.html", {"email": user.email}
-            )
-    else:
-        form = RegistrationForm()
-    return render(request, "accounts/register.html", {"form": form})
+from .models import ClientApp, UserRole
+from .utils import create_one_time_token, verify_and_mark_token
 
 
-def activate_and_set_password(request, token):
-    """Activation link where user sets their password."""
-    payload = load_activation_token(token)
-    if not payload:
-        return render(request, "accounts/activation_invalid.html")
+def sso_login(request):
+    """
+    Render login form (or use Django's AuthenticationForm).
+    Accepts ?client_id=...&next=...
+    After successful login, create a one-time token and redirect to client with ?token=...
+    """
+    client_id = request.GET.get("client_id")
+    next_url = request.GET.get("next")
 
-    user_pk = payload.get("user_pk")
-    user = get_object_or_404(User, pk=user_pk)
+    if not client_id or not next_url:
+        return HttpResponseBadRequest("Missing client_id or next parameter")
+
+    try:
+        app = ClientApp.objects.get(client_id=client_id)
+    except ClientApp.DoesNotExist:
+        return HttpResponseBadRequest("Unknown client_id")
 
     if request.method == "POST":
-        form = SetPasswordForm(request.POST, instance=user)
-        if form.is_valid():
-            form.save()
-            user.is_active = True
-            user.save()
-            login(request, user)
-            # Optionally redirect to a default page or client
-            return redirect(settings.LOGIN_REDIRECT_URL or "/")
-    else:
-        form = SetPasswordForm(instance=user)
-
-    return render(request, "accounts/activation_set_password.html", {"form": form})
-
-
-def activate_and_continue(request, token):
-    """Activation + OAuth continuation flow."""
-    payload = load_activation_token(token)
-    if not payload:
-        return render(request, "accounts/activation_invalid.html", status=400)
-
-    user_pk = payload.get("user_pk")
-    client_id = payload.get("client_id")
-    redirect_uri = payload.get("redirect_uri")
-    state = payload.get("state")
-
-    user = get_object_or_404(User, pk=user_pk)
-
-    if not user.is_active:
-        user.is_active = True
-        user.save()
-
-    login(request, user)
-
-    if client_id:
-        try:
-            app = Application.objects.get(client_id=client_id)
-        except Application.DoesNotExist:
+        username = request.POST.get("username")
+        password = request.POST.get("password")
+        user = authenticate(request, username=username, password=password)
+        if user:
+            django_login(request, user)
+            token = create_one_time_token(user, app)
+            # redirect to client callback with token
+            redirect_to = f"{next_url}?token={token}"
+            return redirect(redirect_to)
+        else:
             return render(
                 request,
-                "accounts/activation_invalid.html",
-                {"error": "Invalid client_id"},
-                status=400,
+                "accounts/sso_login.html",
+                {"error": "Invalid credentials", "next": next_url},
             )
-
-        # Validate redirect_uri if provided
-        if redirect_uri:
-            allowed_uris = [u.strip() for u in app.redirect_uris.split() if u.strip()]
-            if redirect_uri not in allowed_uris:
-                return render(
-                    request,
-                    "accounts/activation_invalid.html",
-                    {"error": "redirect_uri not allowed"},
-                    status=400,
-                )
-
-        # Build OAuth2 authorize URL
-        authorize_path = reverse("oauth2_provider:authorize")
-        authorize_url = request.build_absolute_uri(authorize_path)
-        params = {"response_type": "code", "client_id": client_id}
-        if redirect_uri:
-            params["redirect_uri"] = redirect_uri
-        if state:
-            params["state"] = state
-        query_string = urlencode(params)
-        return redirect(f"{authorize_url}?{query_string}")
-
-    # Default fallback
-    return redirect(settings.LOGIN_REDIRECT_URL or "/")
+    return render(request, "accounts/sso_login.html", {"next": next_url})
 
 
+@csrf_exempt
+def sso_verify(request):
+    """
+    POST { token: "..." } --> returns JSON { username, email, roles } on success or error.
+    Client app exchanges one-time token for user info.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest("POST required")
+
+    # extract token from POST or JSON body
+    token = request.POST.get("token")
+    if not token:
+        try:
+            import json
+            body = json.loads(request.body.decode())
+            token = body.get("token")
+        except Exception:
+            token = None
+
+    if not token:
+        return JsonResponse({"error": "missing_token"}, status=400)
+
+    user, app, err = verify_and_mark_token(token)
+    if err:
+        return JsonResponse({"error": err}, status=400)
+
+    # get user roles for this app
+    roles = list(
+        UserRole.objects.filter(user=user, app=app).values_list("role__name", flat=True)
+    )
+
+    return JsonResponse(
+        {
+            "username": user.username,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "roles": roles,
+            "app": app.name,
+        }
+    )

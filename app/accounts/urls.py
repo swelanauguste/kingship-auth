@@ -1,8 +1,8 @@
-# accounts/urls.py
 from django.urls import path
-from .views import activate_and_continue, register, activate_and_set_password
+
+from . import views
 
 urlpatterns = [
-    path("activate/<str:token>/", activate_and_set_password, name="activate_and_continue"),
-    path("register/", register, name="register"),
+    path("sso/login/", views.sso_login, name="sso_login"),
+    path("sso/verify/", views.sso_verify, name="sso_verify"),
 ]
